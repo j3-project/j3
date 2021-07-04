@@ -1,0 +1,182 @@
+"""기본 환경 설정."""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from configparser import ConfigParser
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Type, cast
+
+from sqlalchemy.pool import Pool, StaticPool
+
+from j3.core import AbstractFastMSA, AbstractMessageBroker
+from j3.redis import RedisConnectInfo
+
+
+@dataclass
+class FastMSASetupConfig:
+    name: str
+    title: Optional[str] = None
+    module_name: Optional[str] = None
+    module_path: Optional[str] = None
+
+
+def load_setupcfg(path: Path) -> Optional[FastMSASetupConfig]:
+    if (path / "setup.cfg").exists():
+        # 현재 경로에 "setup.cfg" 파일이 있다면 [j3] 섹션에서
+        # name, module 등의 정보를 읽습니다.
+        config = ConfigParser()
+        config.read("setup.cfg")
+        if "j3" in config:
+            return FastMSASetupConfig(**config["j3"])
+    return None
+
+
+@dataclass
+class J3(AbstractFastMSA):
+    """J3 App 설정."""
+
+    name: str
+    title: str
+    module_path: Path
+    module_name: str
+    allow_external_event = False
+
+    """외부 메세지 브로커를 사용할지 여부."""
+    is_implicit_name: bool = True
+    """setup.cfg 없이 암시적으로 부여된 이름인지 여부."""
+    _broker: Optional[AbstractMessageBroker] = None
+
+    @staticmethod
+    def load_from_config(path=Path(".")) -> J3:
+        """`name` 정보를 이용해  `config.py` 를 로드한다."""
+        cfg = load_setupcfg(path)
+        if cfg:
+            name = cfg.name
+        else:
+            name = path.absolute().name
+        module_name = name
+        module_path = Path(".") / name
+        is_implicit_name = True
+        title: Optional[str]
+
+        if cfg:
+            is_implicit_name = False
+            name = cfg.name
+            module_name = cfg.module_name or name
+            title = cfg.title or name
+
+            if cfg.module_path:
+                module_path = Path(cfg.module_path)
+            elif module_name:
+                module_path = Path(".") / Path(module_name.replace(".", "/"))
+
+        abs_path = str(path.absolute())
+        assert name.isidentifier()
+
+        if (module_path / "config.py").exists():
+            if abs_path not in sys.path:
+                sys.path.insert(0, abs_path)
+
+            conf_module = importlib.import_module(f"{module_name}.config")
+            # config.py 파일이 발견되면 이 설정을 로드합니다.
+            UserConfig = cast(Type[J3], getattr(conf_module, "Config"))
+            title = cfg.title or UserConfig.title
+        else:
+            UserConfig = J3
+            title = name
+
+        # 만일 setup.cfg 를 덮어씌우는 UserSetting 이 있다면 이걸 먼저 사용한다.
+
+        kwargs = dict(
+            name=name,
+            title=title,
+            module_name=module_name,
+            module_path=module_path,
+            is_implicit_name=is_implicit_name,
+        )
+
+        return UserConfig(**kwargs)
+
+    @property
+    def api(self):
+        from j3.api import app  # noqa
+
+        return app
+
+    def get_api_host(self) -> str:
+        """Get API server's host address."""
+        return "127.0.0.1"
+
+    def get_api_port(self) -> int:
+        """Get API server's host port."""
+        return 5000
+
+    def get_api_url(self) -> str:
+        """Get API server's full url."""
+        return f"http://{self.get_api_host()}:{self.get_api_port()}"
+
+    def get_db_url(self) -> str:
+        """SqlAlchemy 에서 사용 가능한 형식의 DB URL을 리턴합니다.
+
+        다음처럼 OS 환경변수를 이용할 수도 있씁니다.
+
+        if self.mode == "prod":
+            db_host = os.environ.get("DB_HOST", "localhost")
+            db_user = os.environ.get("DB_USER", "postgres")
+            db_pass = os.environ.get("DB_PASS", "password")
+            db_name = os.environ.get("DB_NAME", db_user)
+            return f"postgresql://{db_user}:{db_pass}@{db_host}/{db_name}"
+        else:
+            return f"sqlite://"
+        """
+
+        raise NotImplementedError
+
+    @property
+    def broker(self) -> Optional[AbstractMessageBroker]:
+        from j3.redis import RedisMessageBroker
+
+        if not self.allow_external_event:
+            return None
+        else:
+            if not self._broker:
+                self._broker = cast(
+                    AbstractMessageBroker,
+                    RedisMessageBroker(self.redis_conn_info, self),
+                )
+            return self._broker
+
+    @property
+    def redis_conn_info(self) -> RedisConnectInfo:
+        return RedisConnectInfo(
+            host="localhost",
+            port=6379,
+        )
+
+    def get_db_connect_args(self) -> dict[str, Any]:
+        """Get db connection arguments for SQLAlchemy's engine creation.
+
+        Example:
+            For SQLite dbs, it could be: ::
+
+                {'check_same_thread': False}
+        """
+        return {}
+
+    def get_db_poolclass(self) -> Optional[Type[Pool]]:
+        """Get db poolclass arguemnt for SQLAlchemy's engine creation.
+
+        Returns:
+            A pool class
+
+        """
+        return StaticPool
+
+    def init_fastapi(self):
+        """J3 설정을 FastAPI 앱에 적용합니다."""
+        from j3.api import app
+
+        app.title = self.title
