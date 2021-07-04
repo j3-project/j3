@@ -24,7 +24,7 @@ with open(path.join(this_dir, "README.md")) as f:
 version = j3.__version__
 
 setup(
-    name="J3 Framework",
+    name="j3-framework",
     description="J3 Framework - full-stack framework for microservice architecture applications",
     long_description=long_description,
     long_description_content_type="text/markdown",
